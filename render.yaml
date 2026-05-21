@@ -10,7 +10,7 @@ services:
       - key: NODE_VERSION
         value: 24.14.0
       - key: LINEPAY_ENV
-        value: sandbox
+        value: production
       - key: LINEPAY_CHANNEL_ID
         sync: false
       - key: LINEPAY_CHANNEL_SECRET
