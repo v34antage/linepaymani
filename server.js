@@ -1,5 +1,7 @@
 const http = require('http');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 loadDotenv();
 
@@ -8,6 +10,8 @@ const LINEPAY_CHANNEL_SECRET = process.env.LINEPAY_CHANNEL_SECRET;
 const LINEPAY_ENV = process.env.LINEPAY_ENV || 'sandbox';
 const RETURN_HOST = process.env.RETURN_HOST || process.env.RENDER_EXTERNAL_URL || 'http://localhost:3000';
 const PORT = process.env.PORT || 3000;
+const STATIC_DIR = path.join(__dirname, 'public');
+const LINE_OFFICIAL_ACCOUNT_URL = 'https://line.me/R/ti/p/%40275yblcx';
 
 if (!LINEPAY_CHANNEL_ID || !LINEPAY_CHANNEL_SECRET) {
   throw new Error('Missing LINEPAY_CHANNEL_ID or LINEPAY_CHANNEL_SECRET in environment variables.');
@@ -45,7 +49,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && url.pathname === '/api/linepay/cancel') {
-      return sendHtml(res, 200, renderPaymentPage('Payment canceled', 'Please return to the order page and try again.', 'orange'));
+      return sendHtml(res, 200, renderPaymentPage('付款已取消', '請回到點餐頁面重新操作。', 'orange'));
+    }
+
+    if (req.method === 'GET') {
+      return sendStaticFile(url.pathname, res);
     }
 
     return sendJson(res, 404, { success: false, message: 'Not found' });
@@ -101,7 +109,7 @@ async function handleLinePayConfirm(url, res) {
   const amount = url.searchParams.get('amount');
 
   if (!transactionId || !Number.isInteger(Number(amount)) || Number(amount) <= 0) {
-    return sendHtml(res, 400, renderPaymentPage('Invalid payment data', 'Missing transactionId or invalid amount.', 'red'));
+    return sendHtml(res, 400, renderPaymentPage('付款資料有誤', '缺少 transactionId 或金額不正確。', 'red'));
   }
 
   const uri = `/v3/payments/${transactionId}/confirm`;
@@ -114,10 +122,18 @@ async function handleLinePayConfirm(url, res) {
 
   if (response.returnCode !== '0000') {
     console.error('LINE Pay confirm rejected:', response);
-    return sendHtml(res, 200, renderPaymentPage('Payment failed', `Reason: ${escapeHtml(response.returnMessage)}`, 'red'));
+    return sendHtml(res, 200, renderPaymentPage('付款失敗', `原因：${escapeHtml(response.returnMessage)}`, 'red'));
   }
 
-  return sendHtml(res, 200, renderPaymentPage('Payment complete', 'Your order payment was completed successfully.', 'green'));
+  return sendHtml(
+    res,
+    200,
+    renderPaymentPage('付款完成', '您的 LINE Pay 付款已成功完成，訂單明細已在剪貼簿中。', 'green', {
+      redirectUrl: LINE_OFFICIAL_ACCOUNT_URL,
+      redirectSeconds: 3,
+      redirectText: '請點擊下方按鈕開啟 LINE 官方帳號，並在對話框中貼上訂單送出。'
+    })
+  );
 }
 
 async function postLinePay(uri, requestBody) {
@@ -207,24 +223,95 @@ function sendHtml(res, statusCode, html) {
   return res.end(html);
 }
 
+function sendStaticFile(requestPath, res) {
+  const cleanPath = requestPath === '/' ? '/index.html' : decodeURIComponent(requestPath);
+  const filePath = path.normalize(path.join(STATIC_DIR, cleanPath));
+
+  if (!filePath.startsWith(STATIC_DIR)) {
+    return sendJson(res, 403, { success: false, message: 'Forbidden' });
+  }
+
+  const targetPath = fs.existsSync(filePath) && fs.statSync(filePath).isFile()
+    ? filePath
+    : path.join(STATIC_DIR, 'index.html');
+
+  fs.readFile(targetPath, (error, content) => {
+    if (error) {
+      return sendJson(res, 404, { success: false, message: 'Not found' });
+    }
+
+    res.writeHead(200, {
+      'Content-Type': getContentType(targetPath)
+    });
+    return res.end(content);
+  });
+}
+
+function getContentType(filePath) {
+  const extension = path.extname(filePath).toLowerCase();
+  const types = {
+    '.html': 'text/html; charset=utf-8',
+    '.js': 'text/javascript; charset=utf-8',
+    '.jsx': 'text/javascript; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.svg': 'image/svg+xml; charset=utf-8',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.webp': 'image/webp',
+    '.ico': 'image/x-icon'
+  };
+
+  return types[extension] || 'application/octet-stream';
+}
+
 function setCorsHeaders(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
 
-function renderPaymentPage(title, message, color) {
+function renderPaymentPage(title, message, color, options = {}) {
+  const { redirectUrl, redirectSeconds = 3, redirectText } = options;
+  const redirectBlock = redirectUrl
+    ? `
+        <p style="font-weight: 700; color: #444; line-height: 1.6;">${escapeHtml(redirectText || '請開啟 LINE 官方帳號。')}</p>
+        <p style="color: #666;">若瀏覽器允許，<span id="countdown">${redirectSeconds}</span> 秒後會自動開啟 LINE。</p>
+        <p style="margin-top: 24px;">
+          <a href="${escapeHtml(redirectUrl)}" style="display: inline-block; background: #06C755; color: #fff; font-weight: 800; text-decoration: none; padding: 14px 22px; border-radius: 12px; box-shadow: 0 8px 20px rgba(6, 199, 85, 0.25);">
+            開啟 LINE 傳送訂單
+          </a>
+        </p>
+        <p style="font-size: 14px; color: #777;">開啟後請長按輸入框貼上訂單內容。</p>
+        <script>
+          const redirectUrl = ${JSON.stringify(redirectUrl)};
+          let seconds = ${Number(redirectSeconds)};
+          const countdown = document.getElementById('countdown');
+          const timer = setInterval(() => {
+            seconds -= 1;
+            if (countdown) countdown.textContent = String(Math.max(seconds, 0));
+            if (seconds <= 0) {
+              clearInterval(timer);
+              window.location.href = redirectUrl;
+            }
+          }, 1000);
+        </script>
+      `
+    : '';
+
   return `
     <!doctype html>
-    <html lang="en">
+    <html lang="zh-Hant">
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>${escapeHtml(title)}</title>
       </head>
-      <body style="font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; text-align: center; margin-top: 50px;">
-        <h1 style="color: ${color};">${escapeHtml(title)}</h1>
+      <body style="font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; text-align: center; margin: 50px 16px 0;">
+        <h1 style="color: ${escapeHtml(color)};">${escapeHtml(title)}</h1>
         <p>${message}</p>
+        ${redirectBlock}
       </body>
     </html>
   `;
@@ -240,8 +327,6 @@ function escapeHtml(value) {
 }
 
 function loadDotenv() {
-  const fs = require('fs');
-  const path = require('path');
   const envPath = path.join(__dirname, '.env');
 
   if (!fs.existsSync(envPath)) {
