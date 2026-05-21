@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: linepay-order-server
+    runtime: node
+    plan: free
+    buildCommand: npm install --omit=dev
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 24.14.0
+      - key: LINEPAY_ENV
+        value: sandbox
+      - key: LINEPAY_CHANNEL_ID
+        sync: false
+      - key: LINEPAY_CHANNEL_SECRET
+        sync: false
