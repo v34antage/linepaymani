@@ -8,10 +8,14 @@ loadDotenv();
 const LINEPAY_CHANNEL_ID = process.env.LINEPAY_CHANNEL_ID;
 const LINEPAY_CHANNEL_SECRET = process.env.LINEPAY_CHANNEL_SECRET;
 const LINEPAY_ENV = process.env.LINEPAY_ENV || 'sandbox';
+const LINE_MESSAGING_CHANNEL_ACCESS_TOKEN = process.env.LINE_MESSAGING_CHANNEL_ACCESS_TOKEN;
+const LINE_MESSAGING_CHANNEL_SECRET = process.env.LINE_MESSAGING_CHANNEL_SECRET;
+const LINE_ORDER_NOTIFY_TO = process.env.LINE_ORDER_NOTIFY_TO;
 const RETURN_HOST = process.env.RETURN_HOST || process.env.RENDER_EXTERNAL_URL || 'http://localhost:3000';
 const PORT = process.env.PORT || 3000;
 const STATIC_DIR = path.join(__dirname, 'public');
 const LINE_OFFICIAL_ACCOUNT_URL = 'https://line.me/R/ti/p/%40275yblcx';
+const pendingLinePayOrders = new Map();
 
 if (!LINEPAY_CHANNEL_ID || !LINEPAY_CHANNEL_SECRET) {
   throw new Error('Missing LINEPAY_CHANNEL_ID or LINEPAY_CHANNEL_SECRET in environment variables.');
@@ -44,6 +48,14 @@ const server = http.createServer(async (req, res) => {
       return await handleLinePayRequest(req, res);
     }
 
+    if (req.method === 'POST' && url.pathname === '/api/orders/notify-line') {
+      return await handleLineOrderNotification(req, res);
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/line/webhook') {
+      return await handleLineWebhook(req, res);
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/linepay/confirm') {
       return await handleLinePayConfirm(url, res);
     }
@@ -64,7 +76,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 async function handleLinePayRequest(req, res) {
-  const { amount, orderId, packages } = await readJson(req);
+  const { amount, orderId, packages, orderText } = await readJson(req);
 
   if (!Number.isInteger(Number(amount)) || Number(amount) <= 0) {
     return sendJson(res, 400, { success: false, message: 'amount must be a positive integer.' });
@@ -74,6 +86,10 @@ async function handleLinePayRequest(req, res) {
     return sendJson(res, 400, { success: false, message: 'orderId and packages are required.' });
   }
 
+  if (typeof orderText === 'string' && orderText.trim()) {
+    pendingLinePayOrders.set(orderId, orderText.trim());
+  }
+
   const uri = '/v3/payments/request';
   const requestBody = {
     amount: Number(amount),
@@ -81,7 +97,7 @@ async function handleLinePayRequest(req, res) {
     orderId,
     packages,
     redirectUrls: {
-      confirmUrl: `${RETURN_HOST}/api/linepay/confirm?amount=${Number(amount)}`,
+      confirmUrl: `${RETURN_HOST}/api/linepay/confirm?amount=${Number(amount)}&orderId=${encodeURIComponent(orderId)}`,
       cancelUrl: `${RETURN_HOST}/api/linepay/cancel`
     }
   };
@@ -107,6 +123,7 @@ async function handleLinePayRequest(req, res) {
 async function handleLinePayConfirm(url, res) {
   const transactionId = url.searchParams.get('transactionId');
   const amount = url.searchParams.get('amount');
+  const orderId = url.searchParams.get('orderId');
 
   if (!transactionId || !Number.isInteger(Number(amount)) || Number(amount) <= 0) {
     return sendHtml(res, 400, renderPaymentPage('付款資料有誤', '缺少 transactionId 或金額不正確。', 'red'));
@@ -125,6 +142,16 @@ async function handleLinePayConfirm(url, res) {
     return sendHtml(res, 200, renderPaymentPage('付款失敗', `原因：${escapeHtml(response.returnMessage)}`, 'red'));
   }
 
+  if (orderId && pendingLinePayOrders.has(orderId)) {
+    const orderText = pendingLinePayOrders.get(orderId);
+    pendingLinePayOrders.delete(orderId);
+    try {
+      await sendLineOrderNotification(orderText);
+    } catch (error) {
+      console.error('LINE order notification failed:', error.message);
+    }
+  }
+
   return sendHtml(
     res,
     200,
@@ -134,6 +161,66 @@ async function handleLinePayConfirm(url, res) {
       redirectText: '請點擊下方按鈕開啟 LINE 官方帳號，並在對話框中貼上訂單送出。'
     })
   );
+}
+
+async function handleLineOrderNotification(req, res) {
+  const { orderText } = await readJson(req);
+
+  if (!orderText || typeof orderText !== 'string' || !orderText.trim()) {
+    return sendJson(res, 400, { success: false, message: 'orderText is required.' });
+  }
+
+  try {
+    await sendLineOrderNotification(orderText.trim());
+    return sendJson(res, 200, { success: true });
+  } catch (error) {
+    console.error('LINE order notification failed:', error.message);
+    return sendJson(res, 500, {
+      success: false,
+      message: error.message
+    });
+  }
+}
+
+async function handleLineWebhook(req, res) {
+  const body = await readText(req);
+
+  if (LINE_MESSAGING_CHANNEL_SECRET) {
+    const signature = req.headers['x-line-signature'];
+    const expectedSignature = crypto
+      .createHmac('sha256', LINE_MESSAGING_CHANNEL_SECRET)
+      .update(body)
+      .digest('base64');
+
+    const signatureBuffer = Buffer.from(signature || '');
+    const expectedSignatureBuffer = Buffer.from(expectedSignature);
+
+    if (
+      signatureBuffer.length !== expectedSignatureBuffer.length ||
+      !crypto.timingSafeEqual(signatureBuffer, expectedSignatureBuffer)
+    ) {
+      return sendJson(res, 401, { success: false, message: 'Invalid LINE signature.' });
+    }
+  }
+
+  const payload = JSON.parse(body || '{}');
+  const events = Array.isArray(payload.events) ? payload.events : [];
+
+  for (const event of events) {
+    const userId = event.source && event.source.userId;
+
+    if (!userId) {
+      continue;
+    }
+
+    console.log(`LINE webhook userId: ${userId}`);
+
+    if (event.replyToken && LINE_MESSAGING_CHANNEL_ACCESS_TOKEN) {
+      await replyLineMessage(event.replyToken, `訂單通知收件人 ID：${userId}\n請將 Render 環境變數 LINE_ORDER_NOTIFY_TO 設為這串 ID。`);
+    }
+  }
+
+  return sendJson(res, 200, { success: true });
 }
 
 async function postLinePay(uri, requestBody) {
@@ -152,6 +239,79 @@ async function postLinePay(uri, requestBody) {
   }
 
   return data;
+}
+
+async function sendLineOrderNotification(orderText) {
+  if (!LINE_MESSAGING_CHANNEL_ACCESS_TOKEN || !LINE_ORDER_NOTIFY_TO) {
+    throw new Error('Missing LINE_MESSAGING_CHANNEL_ACCESS_TOKEN or LINE_ORDER_NOTIFY_TO.');
+  }
+
+  const response = await fetch('https://api.line.me/v2/bot/message/push', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${LINE_MESSAGING_CHANNEL_ACCESS_TOKEN}`
+    },
+    body: JSON.stringify({
+      to: LINE_ORDER_NOTIFY_TO,
+      messages: [
+        {
+          type: 'text',
+          text: orderText
+        }
+      ]
+    })
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    throw new Error(data.message || `LINE Messaging API returned HTTP ${response.status}`);
+  }
+
+  return data;
+}
+
+async function replyLineMessage(replyToken, text) {
+  const response = await fetch('https://api.line.me/v2/bot/message/reply', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${LINE_MESSAGING_CHANNEL_ACCESS_TOKEN}`
+    },
+    body: JSON.stringify({
+      replyToken,
+      messages: [
+        {
+          type: 'text',
+          text
+        }
+      ]
+    })
+  });
+
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.message || `LINE reply API returned HTTP ${response.status}`);
+  }
+}
+
+function readText(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+
+    req.on('data', (chunk) => {
+      body += chunk;
+
+      if (body.length > 1024 * 1024) {
+        req.destroy();
+        reject(new Error('Request body is too large.'));
+      }
+    });
+
+    req.on('end', () => resolve(body));
+    req.on('error', reject);
+  });
 }
 
 function createLinePayHeaders(uri, requestBody) {
